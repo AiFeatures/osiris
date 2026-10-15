@@ -1,20 +1,25 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { Pause, Play, SkipBack, SkipForward, SlidersHorizontal } from 'lucide-react';
+import { ArrowUp, Pause, Play, SkipBack, SkipForward, Wind } from 'lucide-react';
 import type { Map as MlMap } from 'maplibre-gl';
 import type { WindField } from '@/lib/wind-field';
-import { blendWind, bracketTime, WIND_BANDS, WIND_STYLE, WindOverlay, type WindGrid, type WindStyle } from '@/lib/wind-layer';
+import { blendWind, bracketTime, sampleWind, WIND_BANDS, WIND_STYLE, WindOverlay, type WindGrid, type WindStyle } from '@/lib/wind-layer';
+import { AtCentre, BoxShell, Choice, clock, DAYS, IconButton, Legend, ResetButton, TextButton, TimeReadout, TimeTrack, Tune } from '@/components/TimeBox';
 
 /**
- * OSIRIS — the Wind layer's time slider and controls.
+ * OSIRIS — the Wind layer: its particles, and the small box that holds its
+ * time slider and controls.
  *
  * The slider runs from three days back to five days ahead of the newest GFS
  * run (see /api/wind), a frame every three hours. Between two frames the wind
  * is blended, so scrubbing and playing move smoothly instead of in three-hour
  * jumps. Frames are fetched as the slider nears them, never the whole run.
  * TUNE sets how the particles move: their speed, tail length and density.
+ *
+ * Folding the box leaves a chip with the time on it; the wind keeps blowing
+ * and playing keeps playing. With the layer's Time Controls switched off
+ * there is no box at all, and the wind is drawn as it is now.
  */
 
 const HOUR = 3600_000;
@@ -30,8 +35,10 @@ type Unit = keyof typeof UNITS;
 interface Settings extends WindStyle {
   rate: number;
   unit: Unit;
+  /** The box is open, rather than folded to its chip. */
+  open: boolean;
 }
-const DEFAULTS: Settings = { ...WIND_STYLE, rate: 3, unit: 'km/h' };
+const DEFAULTS: Settings = { ...WIND_STYLE, rate: 3, unit: 'km/h', open: true };
 
 type Frame = Omit<WindField, 'u' | 'v'> & { u: Int16Array; v: Int16Array };
 
@@ -44,14 +51,15 @@ function readSettings(): Settings {
     if (typeof saved?.density === 'number') out.density = saved.density;
     if (RATES.includes(saved?.rate)) out.rate = saved.rate;
     if (saved?.unit in UNITS) out.unit = saved.unit;
+    if (typeof saved?.open === 'boolean') out.open = saved.open;
   } catch { /* storage blocked or corrupt */ }
   return out;
 }
 
 const iso = (t: number) => new Date(t).toISOString();
-const DAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
-const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
-const pad = (n: number) => String(n).padStart(2, '0');
+const POINTS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+/** How often the map-centre reading is taken: the wind changes as the map moves and as time plays. */
+const CENTRE_MS = 250;
 
 /** "+1D 6H", "−18H" — how far the slider is from now. */
 function relative(t: number, now: number): string {
@@ -63,7 +71,12 @@ function relative(t: number, now: number): string {
   return `${sign}${d ? `${d}D` : ''}${d && h ? ' ' : ''}${h ? `${h}H` : ''}`;
 }
 
-export default function WindBar({ mapRef }: { mapRef: React.RefObject<MlMap | null> }) {
+export default function WindBar({ mapRef, controls = true, onOff }: {
+  mapRef: React.RefObject<MlMap | null>;
+  /** Show the box; off, the wind is drawn as it is now. */
+  controls?: boolean;
+  onOff?: () => void;
+}) {
   const overlay = useRef<WindOverlay | null>(null);
   const frames = useRef(new Map<number, Frame>());
   const fetching = useRef(new Set<number>());
@@ -80,13 +93,23 @@ export default function WindBar({ mapRef }: { mapRef: React.RefObject<MlMap | nu
   const [playing, setPlaying] = useState(false);
   const [tuning, setTuning] = useState(false);
   const [settings, setSettings] = useState<Settings>(readSettings);
+  /** The wind drawn at the middle of the map: m/s, and the bearing it blows from. */
+  const [centre, setCentre] = useState<{ speed: number; from: number } | null>(null);
 
   const seek = useCallback((t: number) => {
     timeRef.current = t;
     setTime(t);
   }, []);
+  useEffect(() => { timeRef.current = time; }, [time]);
 
-  // The particles, on their own canvas over the map, for as long as the bar is up.
+  // No controls, no time travel: back to now, and stop.
+  const [hadControls, setHadControls] = useState(controls);
+  if (hadControls !== controls) {
+    setHadControls(controls);
+    if (!controls) { setPlaying(false); setTime(now); }
+  }
+
+  // The particles, on their own canvas over the map, for as long as the layer is on.
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -142,7 +165,7 @@ export default function WindBar({ mapRef }: { mapRef: React.RefObject<MlMap | nu
 
   const first = timeline?.times[0] ?? 0;
   const last = timeline?.times.at(-1) ?? 0;
-  const at = timeline ? Math.min(last, Math.max(first, time)) : time;
+  const at = timeline ? Math.min(last, Math.max(first, controls ? time : now)) : time;
   const [i0, i1, w] = timeline ? bracketTime(timeline.times, at) : [0, 0, 0];
 
   // Draw the wind at the slider, and fetch what it needs next: the frames
@@ -162,6 +185,22 @@ export default function WindBar({ mapRef }: { mapRef: React.RefObject<MlMap | nu
     blended.current = blendWind(a ?? b!, b ?? a!, a && b ? w : 0, blended.current);
     overlay.current?.setField(blended.current);
   }, [timeline, i0, i1, w, loaded, playing, want]);
+
+  // The wind at the middle of the map, read off what the particles ride.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !controls) return;
+    const read = () => {
+      const field = blended.current;
+      if (!field) return;
+      const { lng, lat } = map.getCenter();
+      const wind = sampleWind(field, lng, lat);
+      const next = wind ? { speed: Math.hypot(wind[0], wind[1]), from: (Math.atan2(-wind[0], -wind[1]) * 180 / Math.PI + 360) % 360 } : null;
+      setCentre(prev => (prev && next && Math.abs(prev.speed - next.speed) < 0.05 && Math.abs(prev.from - next.from) < 1 ? prev : next));
+    };
+    const id = setInterval(read, CENTRE_MS);
+    return () => clearInterval(id);
+  }, [mapRef, controls]);
 
   // Play: the model clock runs at `rate` hours a second, and waits at a frame
   // that hasn't arrived rather than run ahead of the data.
@@ -186,6 +225,8 @@ export default function WindBar({ mapRef }: { mapRef: React.RefObject<MlMap | nu
     return () => cancelAnimationFrame(raf);
   }, [playing, timeline, settings.rate, seek]);
 
+  if (!controls) return null;
+
   const togglePlay = () => {
     if (!playing && timeline && at >= last) seek(first);
     setPlaying(p => !p);
@@ -198,147 +239,103 @@ export default function WindBar({ mapRef }: { mapRef: React.RefObject<MlMap | nu
   };
   const update = (patch: Partial<Settings>) => setSettings(s => ({ ...s, ...patch }));
 
-  const pct = (t: number) => (timeline && last > first ? ((t - first) / (last - first)) * 100 : 0);
   const date = new Date(at);
   const rel = relative(at, now);
   const kind = rel === 'NOW' ? 'NOW' : at > now ? 'FORECAST' : 'PAST';
-  const waiting = timeline && !(loaded.has(timeline.times[i0]) && loaded.has(timeline.times[i1]));
+  const tone = kind === 'FORECAST' ? 'text-[var(--gold-primary)]' : kind === 'NOW' ? 'text-[var(--gold-light)]' : 'text-white/55';
+  const waiting = !!timeline && !(loaded.has(timeline.times[i0]) && loaded.has(timeline.times[i1]));
   const days = timeline ? dayMarks(first, last) : [];
+  const centreBand = centre ? WIND_BANDS.findLast(b => centre.speed >= b.from) ?? WIND_BANDS[0] : null;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}
-      className="absolute z-[240] left-3 right-[64px] bottom-[124px] md:left-1/2 md:right-auto md:-translate-x-1/2 md:bottom-[152px] md:w-[min(620px,calc(100vw-140px))] xl:bottom-[46px] xl:w-[min(680px,calc(100vw-840px))] xl:min-w-[440px] pointer-events-auto font-mono"
-      role="group" aria-label="Wind time and controls"
+    <BoxShell
+      icon={Wind} title="Wind" source="NOAA GFS"
+      open={settings.open} playing={playing} tuning={tuning} tuneLabel="Tune the particles"
+      onOpen={() => update({ open: true })}
+      onFold={() => { setTuning(false); update({ open: false }); }}
+      onTune={() => setTuning(o => !o)}
+      onOff={onOff}
+      chip={timeline && (
+        <>
+          <span className="text-[10.5px] font-semibold tracking-wider text-[var(--gold-light)] tabular-nums">{DAYS[date.getDay()]} {clock(date)}</span>
+          <span className={`text-[9px] tracking-wider tabular-nums ${tone}`}>{rel}</span>
+        </>
+      )}
+      tune={(
+        <>
+          <Tune label="FLOW SPEED" value={settings.speed} min={0.25} max={3} step={0.05}
+            format={v => `${v.toFixed(2)}×`} onChange={speed => update({ speed })} />
+          <Tune label="TAIL" value={settings.trail} min={4} max={60} step={1}
+            format={v => (v < 12 ? 'SHORT' : v < 30 ? 'MEDIUM' : 'LONG')} onChange={trail => update({ trail })} />
+          <Tune label="DENSITY" value={settings.density} min={0.25} max={2.5} step={0.05}
+            format={v => `${v.toFixed(2)}×`} onChange={density => update({ density })} />
+          <Legend title={`WIND SPEED · ${settings.unit.toUpperCase()}`} steps={WIND_BANDS.map(band => ({
+            color: `rgba(${band.rgb.join(',')},${band.alpha})`,
+            value: String(Math.round(band.from * UNITS[settings.unit])),
+            name: band.name,
+          }))} />
+          <div className="flex items-center gap-2">
+            <Choice label="Wind speed unit" value={settings.unit} onChange={unit => update({ unit })}
+              options={(Object.keys(UNITS) as Unit[]).map(unit => ({ value: unit, label: unit.toUpperCase() }))} />
+            <ResetButton onClick={() => setSettings(s => ({ ...DEFAULTS, unit: s.unit }))} />
+          </div>
+        </>
+      )}
     >
-      <AnimatePresence>
-        {tuning && (
-          <motion.div
-            initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 6 }} transition={{ duration: 0.18 }}
-            className="mb-1.5 rounded-xl border border-[var(--border-primary)] bg-black/80 backdrop-blur-md px-3 py-2.5 shadow-[0_8px_32px_rgba(0,0,0,0.55)]"
-          >
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-2">
-              <Tune label="FLOW SPEED" value={settings.speed} min={0.25} max={3} step={0.05}
-                format={v => `${v.toFixed(2)}×`} onChange={speed => update({ speed })} />
-              <Tune label="TAIL" value={settings.trail} min={4} max={60} step={1}
-                format={v => (v < 12 ? 'SHORT' : v < 30 ? 'MEDIUM' : 'LONG')} onChange={trail => update({ trail })} />
-              <Tune label="DENSITY" value={settings.density} min={0.25} max={2.5} step={0.05}
-                format={v => `${v.toFixed(2)}×`} onChange={density => update({ density })} />
-            </div>
-            <div className="mt-2.5 flex flex-wrap items-end gap-x-4 gap-y-2">
-              <Legend unit={settings.unit} />
-              <div className="flex items-center gap-[3px] p-[2px] rounded-md border border-white/10" role="radiogroup" aria-label="Wind speed unit">
-                {(Object.keys(UNITS) as Unit[]).map(unit => (
-                  <button key={unit} type="button" role="radio" aria-checked={settings.unit === unit}
-                    onClick={() => update({ unit })}
-                    className={`px-1.5 py-0.5 rounded text-[9px] tracking-wider transition-colors ${settings.unit === unit ? 'bg-[var(--gold-primary)]/15 text-[var(--gold-light)]' : 'text-white/40 hover:text-white/70'}`}>
-                    {unit.toUpperCase()}
-                  </button>
-                ))}
-              </div>
-              <button type="button" onClick={() => setSettings(s => ({ ...DEFAULTS, unit: s.unit }))}
-                className="ml-auto text-[9px] tracking-[0.18em] text-white/35 hover:text-[var(--gold-light)] transition-colors">
-                RESET
-              </button>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {timeline ? (
+        <TimeReadout at={date} rel={rel} note={rel !== 'NOW' ? kind : undefined} tone={tone} waiting={waiting} />
+      ) : (
+        <div className="min-h-[34px] pt-1 text-[10px] tracking-[0.18em] text-white/40">{unavailable ? 'WIND DATA UNAVAILABLE — RETRYING' : 'LOADING NOAA GFS…'}</div>
+      )}
 
-      <div className="rounded-xl border border-[var(--border-primary)] bg-black/70 backdrop-blur-md shadow-[0_8px_32px_rgba(0,0,0,0.55)] px-2 pt-1.5 pb-1">
-        <div className="flex items-center gap-1.5">
-          <IconButton label="Back three hours" display="hidden sm:flex" onClick={() => stepFrame(-1)} disabled={!timeline || at <= first}><SkipBack className="w-3.5 h-3.5" strokeWidth={1.6} /></IconButton>
-          <IconButton label={playing ? 'Pause' : 'Play'} onClick={togglePlay} disabled={!timeline} active={playing}>
-            {playing ? <Pause className="w-3.5 h-3.5" strokeWidth={1.8} /> : <Play className="w-3.5 h-3.5" strokeWidth={1.8} />}
-          </IconButton>
-          <IconButton label="Forward three hours" display="hidden sm:flex" onClick={() => stepFrame(1)} disabled={!timeline || at >= last}><SkipForward className="w-3.5 h-3.5" strokeWidth={1.6} /></IconButton>
-
-          <div className="min-w-0 flex-1 flex items-baseline gap-2 pl-1.5 overflow-hidden whitespace-nowrap" aria-live="off">
-            {timeline ? (
-              <>
-                <span className="text-[11.5px] font-semibold tracking-wider text-[var(--gold-light)] tabular-nums">
-                  {DAYS[date.getDay()]} {date.getDate()}<span className="hidden sm:inline"> {MONTHS[date.getMonth()]}</span> {pad(date.getHours())}:{pad(date.getMinutes())}
-                </span>
-                <span className="hidden sm:inline text-[9px] tracking-wider text-white/35 tabular-nums">{pad(date.getUTCHours())}:{pad(date.getUTCMinutes())}Z</span>
-                <span className={`text-[9px] tracking-[0.16em] ${kind === 'FORECAST' ? 'text-[var(--gold-primary)]' : kind === 'NOW' ? 'text-[var(--gold-light)]' : 'text-white/55'}`}>
-                  {rel}{rel !== 'NOW' && <span className="hidden sm:inline"> · {kind}</span>}
-                </span>
-                {waiting && <span className="text-[9px] tracking-[0.16em] text-white/35 animate-pulse">LOADING</span>}
-              </>
-            ) : (
-              <span className="text-[10px] tracking-[0.18em] text-white/40">{unavailable ? 'WIND DATA UNAVAILABLE — RETRYING' : 'LOADING NOAA GFS…'}</span>
-            )}
-          </div>
-
-          {timeline && rel !== 'NOW' && (
-            <button type="button" onClick={() => seek(Math.min(last, Math.max(first, Date.now())))}
-              className="px-1.5 h-6 rounded-md text-[9px] tracking-[0.16em] text-white/50 hover:text-[var(--gold-light)] hover:bg-[var(--hover-accent)] transition-colors">
-              NOW
-            </button>
-          )}
-          <button type="button" onClick={() => update({ rate: RATES[(RATES.indexOf(settings.rate) + 1) % RATES.length] })}
-            title="Playback speed: model hours per second"
-            className="px-1.5 h-6 rounded-md text-[9px] tracking-wider text-white/50 hover:text-[var(--gold-light)] hover:bg-[var(--hover-accent)] transition-colors tabular-nums">
-            {settings.rate}H/S
-          </button>
-          <IconButton label="Tune the particles" onClick={() => setTuning(o => !o)} active={tuning} pressed={tuning}>
-            <SlidersHorizontal className="w-3.5 h-3.5" strokeWidth={1.6} />
-          </IconButton>
-        </div>
-
-        {/* The track: past solid, forecast dashed, a dot per frame (lit once
-            loaded), a tick at each midnight and the day named under it. */}
-        <div className="relative h-[34px] mx-1.5 mt-0.5">
-          <div className="absolute inset-x-0 top-[11px] h-[3px] rounded-full overflow-hidden">
-            <div className="absolute inset-y-0 left-0 bg-white/20" style={{ width: `${pct(Math.min(now, last))}%` }} />
-            <div className="absolute inset-y-0 right-0"
-              style={{ left: `${pct(Math.max(now, first))}%`, background: 'repeating-linear-gradient(90deg, rgba(var(--gold-rgb),0.45) 0 5px, transparent 5px 8px)' }} />
-            {timeline && (
-              <div className="absolute inset-y-0 bg-[var(--gold-primary)]/60"
-                style={{ left: `${Math.min(pct(at), pct(now))}%`, width: `${Math.abs(pct(at) - pct(now))}%` }} />
-            )}
-          </div>
-          {timeline?.times.map(t => (
-            <span key={t} aria-hidden="true"
-              className={`absolute top-[5px] w-[2px] h-[2px] -ml-px rounded-full ${loaded.has(t) ? 'bg-white/60' : 'bg-white/12'}`}
-              style={{ left: `${pct(t)}%` }} />
-          ))}
-          {days.map(d => (
-            <span key={d.at} aria-hidden="true">
-              {d.at > first && <span className="absolute top-[8px] h-[9px] w-px bg-white/25" style={{ left: `${pct(d.at)}%` }} />}
-              {d.label && (
-                <span className="absolute top-[19px] -translate-x-1/2 text-[8.5px] tracking-[0.14em] text-white/40 whitespace-nowrap"
-                  style={{ left: `${pct(d.mid)}%` }}>{d.label}<span className="hidden sm:inline"> {d.date}</span></span>
-              )}
-            </span>
-          ))}
-          {timeline && now >= first && now <= last && (
-            <span aria-hidden="true" className="absolute top-[4px] h-[17px] w-px bg-[var(--gold-light)]/80" style={{ left: `${pct(now)}%` }} />
-          )}
-          {timeline && (
+      {timeline && (
+        <AtCentre title={centreBand?.name}>
+          {centre && centreBand ? (
             <>
-              <input
-                type="range" min={first} max={last} step={HOUR} value={at}
-                onChange={e => { setPlaying(false); seek(Number(e.target.value)); }}
-                onKeyDown={e => { if (e.key === ' ') { e.preventDefault(); togglePlay(); } }}
-                aria-label="Wind time"
-                aria-valuetext={`${date.toLocaleString(undefined, { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}, ${rel === 'NOW' ? 'now' : `${rel} ${kind.toLowerCase()}`}`}
-                className="peer absolute inset-x-0 top-0 h-[26px] w-full opacity-0 cursor-pointer"
-              />
-              <span aria-hidden="true"
-                className="pointer-events-none absolute top-[6px] -ml-[6px] w-[12px] h-[12px] rounded-full bg-[var(--gold-primary)] border-2 border-black/60 shadow-[0_0_10px_rgba(var(--gold-rgb),0.55)] peer-focus-visible:outline peer-focus-visible:outline-1 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--gold-light)]"
-                style={{ left: `${pct(at)}%` }} />
+              {/* Points the way the wind is going, in its speed band's colour. */}
+              <ArrowUp aria-hidden="true" className="w-3 h-3 shrink-0" strokeWidth={2.2}
+                style={{ transform: `rotate(${centre.from + 180}deg)`, color: `rgb(${centreBand.rgb.join(',')})` }} />
+              <span className="text-[var(--gold-light)]">{Math.round(centre.speed * UNITS[settings.unit])} {settings.unit.toUpperCase()}</span>
+              <span className="text-white/45">FROM {POINTS[Math.round(centre.from / 22.5) % 16]}</span>
             </>
-          )}
+          ) : <span className="text-white/30">—</span>}
+        </AtCentre>
+      )}
+
+      <div className="mt-1 flex items-center gap-0.5">
+        <IconButton label="Back three hours" onClick={() => stepFrame(-1)} disabled={!timeline || at <= first}><SkipBack className="w-3.5 h-3.5" strokeWidth={1.6} /></IconButton>
+        <IconButton label={playing ? 'Pause' : 'Play'} onClick={togglePlay} disabled={!timeline} active={playing}>
+          {playing ? <Pause className="w-3.5 h-3.5" strokeWidth={1.8} /> : <Play className="w-3.5 h-3.5" strokeWidth={1.8} />}
+        </IconButton>
+        <IconButton label="Forward three hours" onClick={() => stepFrame(1)} disabled={!timeline || at >= last}><SkipForward className="w-3.5 h-3.5" strokeWidth={1.6} /></IconButton>
+        <div className="ml-auto flex items-center gap-0.5">
+          {timeline && rel !== 'NOW' && <TextButton onClick={() => seek(Math.min(last, Math.max(first, Date.now())))}>NOW</TextButton>}
+          <TextButton title="Playback speed: model hours per second"
+            onClick={() => update({ rate: RATES[(RATES.indexOf(settings.rate) + 1) % RATES.length] })}>
+            {settings.rate}H/S
+          </TextButton>
         </div>
       </div>
-    </motion.div>
+
+      {timeline && (
+        <TimeTrack
+          first={first} last={last} now={now} at={at} step={HOUR}
+          times={timeline.times} loaded={loaded}
+          ticks={days.map(d => d.at).filter(t => t > first)}
+          labels={days.filter(d => d.label).map(d => ({ at: d.mid, label: d.label! }))}
+          ariaLabel="Wind time"
+          valueText={`${date.toLocaleString(undefined, { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}, ${rel === 'NOW' ? 'now' : `${rel} ${kind.toLowerCase()}`}`}
+          onSeek={t => { setPlaying(false); seek(t); }}
+          onSpace={togglePlay}
+        />
+      )}
+    </BoxShell>
   );
 }
 
 /** Local midnights in range, and a day label centred on each day's stretch when there's room. */
-function dayMarks(first: number, last: number): { at: number; mid: number; label: string | null; date: number }[] {
-  const out: { at: number; mid: number; label: string | null; date: number }[] = [];
+function dayMarks(first: number, last: number): { at: number; mid: number; label: string | null }[] {
+  const out: { at: number; mid: number; label: string | null }[] = [];
   const start = new Date(first);
   start.setHours(0, 0, 0, 0);
   for (let d = start; d.getTime() < last; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) {
@@ -347,52 +344,7 @@ function dayMarks(first: number, last: number): { at: number; mid: number; label
     const from = Math.max(at, first);
     const to = Math.min(end, last);
     const roomy = to - from >= 14 * HOUR;
-    out.push({ at: from, mid: (from + to) / 2, label: roomy ? DAYS[d.getDay()] : null, date: d.getDate() });
+    out.push({ at: from, mid: (from + to) / 2, label: roomy ? DAYS[d.getDay()] : null });
   }
   return out;
-}
-
-function IconButton({ label, onClick, disabled, active, pressed, display = 'flex', children }: {
-  label: string; onClick: () => void; disabled?: boolean; active?: boolean; pressed?: boolean; display?: string; children: React.ReactNode;
-}) {
-  return (
-    <button type="button" title={label} aria-label={label} onClick={onClick} disabled={disabled} aria-pressed={pressed}
-      className={`${display} w-7 h-7 shrink-0 rounded-md items-center justify-center transition-colors disabled:opacity-25 focus-visible:outline focus-visible:outline-1 focus-visible:outline-[var(--gold-primary)] ${active ? 'text-[var(--gold-light)] bg-[var(--gold-primary)]/15' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--hover-accent)]'}`}>
-      {children}
-    </button>
-  );
-}
-
-function Tune({ label, value, min, max, step, format, onChange }: {
-  label: string; value: number; min: number; max: number; step: number;
-  format: (v: number) => string; onChange: (v: number) => void;
-}) {
-  return (
-    <label className="flex flex-col gap-1 min-w-0">
-      <span className="flex items-baseline justify-between text-[8.5px] tracking-[0.18em] text-white/40">
-        {label}
-        <span className="text-[9px] tracking-wider text-[var(--gold-light)]/80 tabular-nums">{format(value)}</span>
-      </span>
-      <input type="range" min={min} max={max} step={step} value={value}
-        onChange={e => onChange(Number(e.target.value))}
-        className="w-full h-1 rounded-full bg-white/10 cursor-pointer" />
-    </label>
-  );
-}
-
-/** The colours the tails are drawn in, and the speed each starts at. */
-function Legend({ unit }: { unit: Unit }) {
-  return (
-    <div className="flex flex-col gap-1">
-      <span className="text-[8.5px] tracking-[0.18em] text-white/40">WIND SPEED · {unit.toUpperCase()}</span>
-      <div className="flex">
-        {WIND_BANDS.map(band => (
-          <div key={band.from} className="flex flex-col items-start gap-0.5 w-[34px]" title={band.name}>
-            <span className="h-[5px] w-full" style={{ background: `rgba(${band.rgb.join(',')},${band.alpha})` }} />
-            <span className="text-[8.5px] tabular-nums text-white/45">{Math.round(band.from * UNITS[unit])}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 }
